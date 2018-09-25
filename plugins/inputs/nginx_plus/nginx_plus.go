@@ -15,6 +15,7 @@ import (
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/inputs"
+	"reflect"
 )
 
 type NginxPlus struct {
@@ -98,6 +99,12 @@ func (n *NginxPlus) gatherUrl(addr *url.URL, acc telegraf.Accumulator) error {
 		return fmt.Errorf("%s returned HTTP status %s", addr.String(), resp.Status)
 	}
 	contentType := strings.Split(resp.Header.Get("Content-Type"), ";")[0]
+	// if use api v3 in url
+	if addr.RequestURI() == "/api/3" || addr.RequestURI() == "/api/3/" {
+		gatherV3(addr, acc, getTags(addr))
+		return nil
+	}
+
 	switch contentType {
 	case "application/json":
 		return gatherStatusUrl(bufio.NewReader(resp.Body), getTags(addr), acc)
@@ -268,6 +275,38 @@ type Status struct {
 		} `json:"upstreams"`
 	} `json:"stream"`
 }
+
+// api v3 types
+type SummInfoV3 struct {
+	Version       string    `json:"version"`
+	Build         string    `json:"build"`
+	Address       string    `json:"address"`
+	Generation    int       `json:"generation"`
+	LoadTimestamp time.Time `json:"load_timestamp"`
+	Timestamp     time.Time `json:"timestamp"`
+	Pid           int       `json:"pid"`
+	Ppid          int       `json:"ppid"`
+}
+
+type ConnectionsV3 struct {
+	Accepted int `json:"accepted"`
+	Dropped  int `json:"dropped"`
+	Active   int `json:"active"`
+	Idle     int `json:"idle"`
+}
+
+type SSLV3 struct {
+	Handshakes int `json:"handshakes"`
+	Handshakes_failed  int `json:"handshakes_failed"`
+	Session_reuses   int `json:"session_reuses"`
+}
+
+type RequestsV3 struct {
+	Total   int `json:"total"`
+	Current int `json:"current"`
+}
+
+
 
 func gatherStatusUrl(r *bufio.Reader, tags map[string]string, acc telegraf.Accumulator) error {
 	dec := json.NewDecoder(r)
@@ -560,6 +599,237 @@ func (s *Status) gatherStreamMetrics(tags map[string]string, acc telegraf.Accumu
 			acc.AddFields("nginx_plus_stream_upstream_peer", peerFields, peerTags)
 		}
 	}
+}
+
+
+func gatherV3(addr *url.URL, acc telegraf.Accumulator, tags map[string]string)  {
+	gatherNginxV3(addr, acc, tags) // done
+	gatherConnectionsV3(addr, acc, tags) // done
+	gatherSSLV3(addr, acc, tags) // done
+	gatherRequestsV3(addr, acc, tags) // done
+
+	gatherSlabsV3(addr, acc, tags) // now work full, work only page, need add slot
+	gatherUpstreamMetricsV3(addr, acc, tags, "http") // done
+	gatherUpstreamMetricsV3(addr, acc, tags, "stream") // done
+
+	gatherCachesV3(addr, acc, tags) //done
+}
+
+func gatherNginxV3(addr *url.URL, acc telegraf.Accumulator, tags map[string]string)  {
+	res, _ := http.Get(addr.String()+"/nginx")
+
+	SummInfoV3 := &SummInfoV3{}
+
+	json.NewDecoder(res.Body).Decode(&SummInfoV3)
+
+	peerFields := map[string]interface{}{
+		"version":                 SummInfoV3.Version,
+		"build":         	       SummInfoV3.Build,
+		"address":                 SummInfoV3.Address,
+		"generation":			   SummInfoV3.Generation,
+		"loadTimestamp":		   SummInfoV3.LoadTimestamp,
+		"timestamp":			   SummInfoV3.Timestamp,
+		"pid":					   SummInfoV3.Pid,
+		"ppid":					   SummInfoV3.Ppid,
+	}
+
+	acc.AddFields("nginx_plus_nginx", peerFields, tags)
+}
+
+func gatherConnectionsV3(addr *url.URL, acc telegraf.Accumulator, tags map[string]string) {
+	res, _ := http.Get(addr.String()+"/connections")
+
+	ConnectionsV3 := &ConnectionsV3{}
+
+	json.NewDecoder(res.Body).Decode(&ConnectionsV3)
+
+	peerFields := map[string]interface{}{
+		"accepted": ConnectionsV3.Accepted,
+		"dropped":	ConnectionsV3.Dropped,
+		"active":	ConnectionsV3.Active,
+		"idle":		ConnectionsV3.Idle,
+	}
+
+	acc.AddFields("nginx_plus_connections", peerFields, tags)
+}
+
+func gatherSSLV3(addr *url.URL, acc telegraf.Accumulator, tags map[string]string)  {
+	res, _ := http.Get(addr.String()+"/ssl")
+
+	SSLV3 := &SSLV3{}
+
+	json.NewDecoder(res.Body).Decode(&SSLV3)
+
+	peerFields := map[string]interface{}{
+		"handshakes": 			SSLV3.Handshakes,
+		"handshakes_failed":	SSLV3.Handshakes_failed,
+		"session_reuses":		SSLV3.Session_reuses,
+	}
+
+	acc.AddFields("nginx_plus_ssl", peerFields, tags)
+}
+
+func gatherUpstreamMetricsV3(addr *url.URL, acc telegraf.Accumulator, tags map[string]string, kind string)  {
+	res, _ := http.Get(addr.String()+"/"+kind+"/upstreams/")
+
+	upstreamTags := map[string]string{}
+	for k, v := range tags {
+		upstreamTags[k] = v
+	}
+
+	var f interface{}
+
+	err := json.NewDecoder(res.Body).Decode(&f)
+	if err != nil {
+		panic(err)
+	}
+
+	m := f.(map[string]interface{})
+
+	for k1, v1 := range m {
+		// upstream metrics
+		upstreamFields := map[string]interface{}{}
+
+		upstreamTags["upstream"] = k1
+
+		for k2,v2 := range v1.(map[string]interface{}) {
+			peerTags := map[string]string{}
+
+			for k, v := range upstreamTags {
+				peerTags[k] = v
+			}
+
+			// peers metric
+			if reflect.TypeOf(v2).String() == "[]interface {}" {
+				for _, v3 := range v2.([]interface{}) {
+
+					peerFields := v3.(map[string]interface{})
+
+					for kt3, t3 := range v3.(map[string]interface{}) {
+
+						if reflect.TypeOf(t3).String() == "map[string]interface {}" {
+							for k4, v4 := range t3.(map[string]interface{}) {
+								peerFields[k4] = v4
+							}
+						} else {
+							if kt3 == "server" {
+								peerTags["upstream_address"] = t3.(string)
+							}
+							if kt3 == "id" {
+								fl64 := t3.(float64)
+								peerTags["id"] = strconv.FormatFloat(fl64, 'f', 0, 64)
+							}
+						}
+					}
+					acc.AddFields("nginx_plus_upstream_peer", peerFields, peerTags)
+				}
+
+			} else {
+				upstreamFields[k2] = v2
+			}
+		}
+
+		acc.AddFields("nginx_plus_upstream", upstreamFields, upstreamTags)
+
+	}
+}
+
+func gatherSlabsV3(addr *url.URL, acc telegraf.Accumulator, tags map[string]string) {
+	res, _ := http.Get(addr.String()+"/slabs/")
+
+	slabsTags := map[string]string{}
+
+	for k, v := range tags {
+		slabsTags[k] = v
+	}
+
+	var f interface{}
+
+	err := json.NewDecoder(res.Body).Decode(&f)
+	if err != nil {
+		panic(err)
+	}
+
+	m := f.(map[string]interface{})
+
+	for k1,v1 := range m {
+
+
+		slabsTags["nginx_plus_slabs_zone_name"] = k1
+		slabsFields := map[string]interface{}{}
+
+		for k2,v2 := range v1.(map[string]interface{}) {
+
+			if k2 == "pages" {
+				for k3,v3 := range v2.(map[string]interface{}){
+					slabsFields[k3] = v3
+				}
+			}
+
+			if k2 == "slots" {
+				for k3,v3 := range v2.(map[string]interface{}){
+					for k4,v4 := range v3.(map[string]interface{}){
+						slabsFields["slots"+k3+"_"+k4] = v4
+
+					}
+				}
+			}
+			acc.AddFields("nginx_plus_slabs", slabsFields, slabsTags)
+		}
+	}
+
+}
+
+func gatherRequestsV3(addr *url.URL, acc telegraf.Accumulator, tags map[string]string) {
+	res, _ := http.Get(addr.String()+"/http/requests")
+
+	RequestsV3 := &RequestsV3{}
+
+	json.NewDecoder(res.Body).Decode(&RequestsV3)
+
+	peerFields := map[string]interface{}{
+		"total":   		RequestsV3.Total,
+		"current":		RequestsV3.Current,
+	}
+
+	acc.AddFields("nginx_plus_requests", peerFields, tags)
+}
+
+func gatherCachesV3(addr *url.URL, acc telegraf.Accumulator, tags map[string]string) {
+	res, _ := http.Get(addr.String()+"/http/caches")
+
+	cacheTags := map[string]string{}
+
+	for k, v := range tags {
+		cacheTags[k] = v
+	}
+
+	var f interface{}
+
+	err := json.NewDecoder(res.Body).Decode(&f)
+	if err != nil {
+		panic(err)
+	}
+
+	m := f.(map[string]interface{})
+
+	for k1, v1 := range m {
+		// caches metrics
+		cacheFields  := map[string]interface{}{}
+
+		cacheTags["cache_zone"] = k1
+		cacheFields = v1.(map[string]interface{})
+
+		for k2, v2 := range v1.(map[string]interface{}){
+			if reflect.TypeOf(v2).String() == "map[string]interface {}" {
+				for k3,v3 := range v2.(map[string]interface{}){
+					cacheFields[k2+"_"+k3] = v3
+				}
+			}
+		}
+
+		acc.AddFields("nginx_plus_caches", cacheFields, cacheTags)
+		}
 }
 
 func init() {
